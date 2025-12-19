@@ -93,7 +93,6 @@ def check_color_match(reference, mask_np, original_image_np):
     return color_dist < CONFIG["filtering_thresholds"]["color_dist_limit"]
 
 
-print("Loading Model...")
 model = build_sam3_image_model(bpe_path=CONFIG["paths"]["bpe_vocab"]).to(device)
 
 transform = ComposeAPI(transforms=[
@@ -112,10 +111,9 @@ postprocessor = PostProcessImage(
     to_cpu=True,
 )
 
-print("Learning Reference Color...")
 ref_features = get_reference_features(CONFIG["paths"]["reference_image"], CONFIG["paths"]["reference_box_xywh"])
 
-print("Building Batch...")
+
 datapoints, query_map = [], []
 for path in CONFIG["paths"]["batch_images"]:
     if not os.path.exists(path): continue
@@ -126,7 +124,7 @@ for path in CONFIG["paths"]["batch_images"]:
     datapoints.append(transform(dp))
     query_map.append({"id": qid, "path": path, "original_image": np.array(img)})
 
-print("Running Inference...")
+
 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 with torch.autocast("cuda", dtype=dtype), torch.inference_mode():
     batch = collate(datapoints, dict_key="dummy")["dummy"]
@@ -134,7 +132,7 @@ with torch.autocast("cuda", dtype=dtype), torch.inference_mode():
     output = model(batch)
     processed_results = postprocessor.process_results(output, batch.find_metadatas)
 
-print("Adaptive Filtering Results...")
+
 os.makedirs(CONFIG["paths"]["output_dir"], exist_ok=True)
 
 for item in query_map:
