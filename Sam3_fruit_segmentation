@@ -1,0 +1,212 @@
+import torch
+import torchvision
+import sys
+import os
+import numpy as np
+from PIL import Image
+from typing import List
+
+from sam3.train.data.collator import collate_fn_api as collate
+from sam3.model.utils.misc import copy_data_to_device
+from sam3.model_builder import build_sam3_image_model
+from sam3.train.transforms.basic_for_api import ComposeAPI, RandomResizeAPI, ToTensorAPI, NormalizeAPI
+from sam3.eval.postprocessors import PostProcessImage
+from sam3.visualization_utils import plot_results
+from sam3.train.data.sam3_image_dataset import InferenceMetadata, FindQueryLoaded, Image as SAMImage, Datapoint
+
+# Hardware Setup
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+GLOBAL_COUNTER = 1
+
+def create_empty_datapoint():
+    return Datapoint(find_queries=[], images=[])
+
+def set_image(datapoint, pil_image):
+    w, h = pil_image.size
+    datapoint.images = [SAMImage(data=pil_image, objects=[], size=[h, w])]
+
+def add_text_prompt(datapoint, text_query):
+    global GLOBAL_COUNTER
+    assert len(datapoint.images) == 1, "please set the image first"
+    w, h = datapoint.images[0].size
+    datapoint.find_queries.append(
+        FindQueryLoaded(
+            query_text=text_query,
+            image_id=0,
+            object_ids_output=[],
+            is_exhaustive=True,
+            query_processing_order=0,
+            inference_metadata=InferenceMetadata(
+                coco_image_id=GLOBAL_COUNTER,
+                original_image_id=GLOBAL_COUNTER,
+                original_category_id=1,
+                original_size=[w, h],
+                object_id=0,
+                frame_index=0,
+            )
+        )
+    )
+    GLOBAL_COUNTER += 1
+    return GLOBAL_COUNTER - 1
+
+def get_reference_features(image_path, box_xywh):
+    img = Image.open(image_path).convert("RGB")
+    x, y, w, h = [int(v) for v in box_xywh]
+    crop = img.crop((x, y, x+w, y+h))
+    crop_np = np.array(crop)
+    
+    # We ONLY trust color from the reference, NOT size
+    mean_color = crop_np.mean(axis=(0, 1)) 
+    return {"color": mean_color}
+
+def check_color_match(reference, mask_np, original_image_np):
+    """Checks if the object is roughly the right color."""
+    if mask_np.ndim == 3: mask_np = mask_np.squeeze()
+    
+    masked_pixels = original_image_np[mask_np > 0]
+    if masked_pixels.size == 0: return False
+    
+    mean_color = masked_pixels.mean(axis=0)
+    color_dist = np.linalg.norm(reference['color'] - mean_color)
+    return color_dist < 80.0
+
+
+
+ref_config = {
+    "path": "/pub0/joel/fruit_segmentation/orange2_images/orange3_highres.png",
+    "box_xywh": [240, 190.0, 160, 200.0] 
+}
+
+batch_image_paths = [
+    "/pub0/joel/fruit_segmentation/orange2_images/orange3_highres.png",
+    "/pub0/joel/fruit_segmentation/orange_images/orange1.jpg"
+    # Add your other images here
+]
+
+print("Loading Model...")
+bpe_path = "/pub0/joel/fruit_segmentation/sam3/assets/bpe_simple_vocab_16e6.txt.gz"
+model = build_sam3_image_model(bpe_path=bpe_path).to(device)
+
+transform = ComposeAPI(transforms=[
+    RandomResizeAPI(sizes=1008, max_size=1008, square=True, consistent_transform=False),
+    ToTensorAPI(),
+    NormalizeAPI(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+])
+
+# IMPORTANT: Low threshold to catch everything initially
+postprocessor = PostProcessImage(
+    max_dets_per_img=-1,
+    iou_type="segm",
+    use_original_sizes_box=True,
+    use_original_sizes_mask=True,
+    convert_mask_to_rle=False,
+    detection_threshold=0.4, 
+    to_cpu=True,
+)
+
+print("Learning Reference Color...")
+ref_features = get_reference_features(ref_config["path"], ref_config["box_xywh"])
+print(f"Reference Color: {ref_features['color'].astype(int)}")
+
+print("Building Batch...")
+datapoints = []
+query_map = [] 
+
+for path in batch_image_paths:
+    if not os.path.exists(path): continue
+    img = Image.open(path).convert("RGB")
+    dp = create_empty_datapoint()
+    set_image(dp, img)
+    
+    # Use generic prompt
+    qid = add_text_prompt(dp, "orange segment")
+    
+    dp = transform(dp)
+    datapoints.append(dp)
+    query_map.append({"id": qid, "path": path, "original_image": np.array(img)})
+
+print("Running Inference...")
+dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+with torch.autocast("cuda", dtype=dtype):
+    with torch.inference_mode():
+        batch = collate(datapoints, dict_key="dummy")["dummy"]
+        batch = copy_data_to_device(batch, device, non_blocking=True)
+        output = model(batch)
+        processed_results = postprocessor.process_results(output, batch.find_metadatas)
+
+print("Adaptive Filtering Results...")
+output_dir = "/pub0/joel/fruit_segmentation/batch_results/"
+os.makedirs(output_dir, exist_ok=True)
+
+for item in query_map:
+    qid = item["id"]
+    path = item["path"]
+    original_img = item["original_image"]
+    
+    if qid not in processed_results: continue
+    res = processed_results[qid]
+    
+    masks = res["masks"] 
+    scores = res["scores"]
+    boxes = res["boxes"]
+
+    # Convert to standard types
+    if torch.is_tensor(masks): masks = masks.float().cpu().numpy()
+    if torch.is_tensor(scores): scores = scores.float().cpu().numpy()
+    if torch.is_tensor(boxes): boxes = boxes.float().cpu().numpy()
+
+    # --- ADAPTIVE LOGIC STARTS HERE ---
+    
+    # 1. First Pass: Collect everything that looks like an orange (Color Match)
+    candidates = []
+    for i, mask in enumerate(masks):
+        if check_color_match(ref_features, mask, original_img):
+             # Save index and area
+             mask_area = np.sum(mask > 0)
+             candidates.append({
+                 "index": i,
+                 "area": mask_area,
+                 "score": scores[i]
+             })
+    
+    if not candidates:
+        print(f"{os.path.basename(path)}: No color matches found.")
+        continue
+
+    # 2. Determine Local Zoom Level (Median Size of High-Confidence Objects)
+    # We look at objects where the model is confident (>0.25) to set the standard
+    high_conf_areas = [c["area"] for c in candidates if c["score"] > 0.25]
+    
+    if len(high_conf_areas) > 0:
+        local_median_area = np.median(high_conf_areas)
+    else:
+        # Fallback: If no high confidence matches, use median of ALL color matches
+        local_median_area = np.median([c["area"] for c in candidates])
+        
+    print(f"[{os.path.basename(path)}] Local Median Size: {int(local_median_area)} px")
+
+    # 3. Second Pass: Filter by Local Size
+    valid_indices = []
+    for c in candidates:
+        # Allow variation (e.g., 20% to 300% of the local median)
+        # This rejects tiny noise specks or huge background blobs
+        if 0.1 * local_median_area < c["area"] < 4.0 * local_median_area:
+            valid_indices.append(c["index"])
+
+    print(f" > Kept {len(valid_indices)} segments.")
+
+    if len(valid_indices) > 0:
+        filtered_res = {
+            "masks": torch.from_numpy(masks[valid_indices]),
+            "boxes": torch.from_numpy(boxes[valid_indices]),
+            "scores": torch.from_numpy(scores[valid_indices]),
+        }
+
+        plot_results(
+            Image.fromarray(original_img), 
+            filtered_res, 
+            save_path=os.path.join(output_dir, f"filtered_{os.path.basename(path)}")
+        )
